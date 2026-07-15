@@ -135,6 +135,12 @@ class GameHUD(Entity):
                               origin=(0, 0), color=color.black,
                               position=Vec3(0.03, -0.125, -0.02))
 
+        # Marcador de OLEADAS RESTANTES (arriba al centro, bajo la barra).
+        # Texto reutilizado: solo se reasigna cuando cambia el número.
+        self.waves_text = Text(parent=self, text='', scale=1.0, origin=(0, 0),
+                               color=color.white, position=Vec3(0.03, 0.365, 0))
+        self.waves_text.enabled = False
+
         # ============= VIDA DEL JUGADOR (arriba a la derecha) =============
         # Retrato del detective (arte rubber-hose): UN indicador cuyo
         # sprite cambia con el daño — confiado, golpeado, hecho polvo.
@@ -146,6 +152,23 @@ class GameHUD(Entity):
         self.life_icon = Entity(parent=self, model='quad',
                                 position=Vec3(right - 0.16, 0.36, 0))
         self._set_life_art(3)
+
+        # ---- Barra de vida continua JUNTO al retrato ----
+        # Se ancla relativa a la posición del retrato (life_icon), así queda
+        # "al lado" esté donde esté el retrato. Aquí, a su izquierda (hacia
+        # el centro) para no salirse del borde. Si mueves el retrato a otra
+        # esquina, cambia el signo del offset en X.
+        HB_W, HB_H = 0.26, 0.03
+        hb_pos = Vec3(self.life_icon.x - 0.21, self.life_icon.y, 0)
+        self._hp_bar_w = HB_W
+        # Marco/fondo oscuro.
+        Entity(parent=self, model='quad', color=color.dark_gray,
+               scale=(HB_W + 0.012, HB_H + 0.012), position=hb_pos + Vec3(0, 0, 0.01))
+        # Relleno con origin en el borde izquierdo: se vacía hacia la derecha
+        # cambiando SOLO scale_x (un quad sin textura, cero redibujos).
+        self.hp_fill = Entity(parent=self, model='quad', origin=(-0.5, 0),
+                              color=color.lime, scale=(HB_W, HB_H),
+                              position=hb_pos + Vec3(-HB_W / 2, 0, 0))
 
         # ============= MINIMAPA (abajo a la izquierda) ====================
         # Marco circular estilo "plano de arquitecto" (arte final) + iconos
@@ -244,6 +267,35 @@ class GameHUD(Entity):
         self.boss_group.enabled = True
         self.boss_fill.scale_x = BOSS_BAR_W * min(1, percent)
 
+    def set_wave(self, label, fraction):
+        """Muestra el progreso de la oleada (o del jefe) en la barra superior.
+
+        A diferencia de update_wave_progress, NO oculta la barra con
+        fracción 0 (queremos ver 'DESPEJADO'). El texto solo se reasigna si
+        cambió: asignar Text.text reconstruye la malla, así que evitamos
+        hacerlo cada frame."""
+        if fraction > 1:
+            fraction /= 100
+        self.boss_group.enabled = True
+        if self.boss_name.text != label:
+            self.boss_name.text = label
+        self.boss_fill.scale_x = BOSS_BAR_W * max(0.0, min(1.0, fraction))
+
+    def hide_wave(self):
+        self.boss_group.enabled = False
+
+    def set_waves_left(self, n):
+        """Marcador 'OLEADAS RESTANTES: n'. Con n<=0 se oculta. El texto solo
+        se reasigna si cambió (asignarlo reconstruye la malla)."""
+        if n <= 0:
+            if self.waves_text.enabled:
+                self.waves_text.enabled = False
+            return
+        self.waves_text.enabled = True
+        txt = f'OLEADAS RESTANTES: {n}'
+        if self.waves_text.text != txt:
+            self.waves_text.text = txt
+
     def update_minimap(self, player_pos, entities_list):
         """Traducción matemática mundo->minimapa (SIN segunda cámara).
 
@@ -302,8 +354,13 @@ class GameHUD(Entity):
 
     # ================================================ CALLBACKS INTERNOS ==
     def _on_hp_changed(self, hp, max_hp):
-        # Salud continua (0..100) -> vidas discretas (0..3) para el HUD.
-        frac = hp / max_hp
+        frac = hp / max_hp if max_hp else 0
+        # 1) Barra continua junto al retrato: se actualiza al recibir daño.
+        #    Solo cambia scale_x/color (sin reconstruir malla): baratísimo.
+        self.hp_fill.scale_x = self._hp_bar_w * max(0.0, min(1.0, frac))
+        self.hp_fill.color = (color.lime if frac > 0.5 else
+                              color.yellow if frac > 0.25 else color.red)
+        # 2) Retrato del detective: salud continua -> 3 estados discretos.
         lives = 3 if frac > 2 / 3 else (2 if frac > 1 / 3 else
                                         (1 if hp > 0 else 0))
         self.update_health(lives)

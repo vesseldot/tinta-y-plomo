@@ -1,95 +1,85 @@
 """
-world.py — Generación del mapa 3D low-poly y sistema de culling por sectores.
+world.py — El Archivero: 3 pisos texturizados apilados en Y, con cobertura,
+y un HUECO DE ESCALERA cerrado por una pared completa que se retira al
+despejar el piso.
 
-ESTRATEGIA DE DRAW CALLS
+TEXTURAS
+--------
+Piso -> assets/ui/piso.png (tileada, double_sided para que sirva de TECHO del
+piso inferior). Muros -> assets/ui/paredes.png (tileados). Todo unlit_shader.
+
+CONEXIÓN VERTICAL FIABLE
 ------------------------
-El coste #1 en GPUs integradas no suele ser la cantidad de polígonos sino la
-cantidad de DRAW CALLS (cada Entity con su propio modelo = 1 llamada al
-driver). Un mapa con 200 cajas sueltas = 200 draw calls.
+Cada rampa vive dentro de un HUECO DE ESCALERA: dos paredes laterales la
+encierran y una PARED COMPLETA (de piso a techo) tapa la entrada. Como el
+FirstPersonController choca con paredes verticales (su raycast frontal) y las
+laterales impiden rodearla, no hay forma de subir hasta que el WaveManager
+retira esa pared al despejar el piso. La rampa sube por un hueco en el piso
+de arriba y el jugador emerge dentro de ese piso.
 
-Solución: dividir el mapa en SECTORES y fusionar toda la geometría estática
-de cada sector en UNA sola malla con Entity.combine():
-    ~200 draw calls  ->  ~36 draw calls (1 por sector).
-Todos los sectores comparten LA MISMA textura ('white_cube') y la variedad
-visual se logra con COLOR DE VÉRTICE (que combine() conserva): así el driver
-tampoco cambia de textura entre llamadas.
+Las rampas ALTERNAN de lado por piso (piso 0 al norte, piso 1 al sur) para
+que no se apilen en la misma columna y el jugador tenga que cruzar el piso.
 
-ESTRATEGIA DE CULLING
----------------------
-1. Frustum culling: Panda3D (el motor debajo de Ursina) ya descarta en C++
-   cualquier nodo fuera del cono de visión de la cámara. Al agrupar por
-   sectores le damos nodos "grandes" fáciles de descartar de golpe.
-2. Occlusion/distancia (manual): Panda3D no trae occlusion culling real, así
-   que lo aproximamos: cada 0.25 s (¡no cada frame!) se desactivan los
-   sectores más lejos de RENDER_DISTANCE. Un sector deshabilitado no entra
-   ni siquiera al recorrido de escena. La niebla (main.py) esconde el corte.
-3. Los COLLIDERS viven en entidades invisibles SEPARADAS que nunca se
-   cullean: la física no se rompe aunque el visual esté apagado, y un box
-   collider sin modelo no cuesta nada de render.
+COBERTURA
+---------
+COVER_PER_FLOOR cajas/columnas con collider por piso, evitando el centro
+(spawn) y las columnas de las escaleras.
 """
 
+import math
 import random
 
-from ursina import Entity, Vec3, camera, color, load_texture, time
+from ursina import Entity, Vec3, color, load_texture
 from ursina.shaders import unlit_shader
 
-from config import (CULL_INTERVAL, MAP_SIZE, RENDER_DISTANCE, SECTOR_SIZE,
-                    SKY_DIST, WORLD_SEED)
+from config import (COVER_PER_FLOOR, FLOOR_HEIGHT, FLOOR_SIZE, FLOOR_WALL_H,
+                    FLOOR_Y, N_FLOORS, RAMP_SLOPE_RUN, RAMP_WIDTH, SKY_DIST,
+                    WORLD_SEED)
 
-# Paleta plana "a lápiz": tonos desaturados que combinan con sprites cel-shaded.
+# Grises planos para cobertura.
 FLAT_PALETTE = [
-    color.hsv(30, 0.25, 0.75),   # arena
-    color.hsv(220, 0.15, 0.55),  # gris azulado
-    color.hsv(20, 0.35, 0.5),    # ladrillo apagado
-    color.hsv(100, 0.2, 0.6),    # verde grisáceo
+    color.hsv(30, 0.12, 0.62),
+    color.hsv(220, 0.10, 0.50),
+    color.hsv(20, 0.18, 0.45),
+    color.hsv(0, 0.0, 0.55),
 ]
+GATE_COL = color.hsv(0, 0.55, 0.45)     # Rojo apagado: pared "bloqueado".
+WALL_ASPECT = 1408 / 768                # Proporción del arte de paredes.
+
+_H = FLOOR_SIZE / 2
+_HOLE_HX = RAMP_WIDTH / 2 + 1.0         # Medio ancho del hueco/rampa en X.
+_SHAFT_HX = RAMP_WIDTH / 2 + 0.5        # Medio ancho de las paredes del hueco.
+
+# Rampa por piso: piso 0 sube por el NORTE, piso 1 por el SUR (el último no
+# sube). El hueco de un piso está en el lado por el que sube el piso de abajo.
+RAMP_SIDES = ['north', 'south']
 
 
-def _add_box(sector, colliders_root, local_pos, size, col):
-    """Caja visual (hija del sector, se fusionará) + collider invisible aparte."""
-    Entity(parent=sector, model='cube', position=local_pos, scale=size, color=col)
-    Entity(parent=colliders_root, collider='box', visible=False,
-           position=sector.position + local_pos, scale=size)
+def _corridor(side):
+    """Geometría del hueco de escalera para un lado ('north'/'south').
+
+    Devuelve el rectángulo del hueco (hx0,hx1,hz0,hz1) y las Z de la rampa.
+    Todo es simétrico respecto al centro: 'south' es 'north' con Z negada.
+    """
+    s = 1 if side == 'north' else -1
+    z_far = s * (_H - 5.0)              # Borde junto al muro perimetral.
+    z_near = s * (_H - 14.0)           # Borde interior del hueco.
+    hz0, hz1 = sorted((z_near, z_far))
+    # El extremo ALTO de la rampa llega EXACTO al borde lejano del hueco
+    # (z_far), que es donde empieza la tira de piso del nivel de arriba: así
+    # el jugador pisa el piso sin caer por el hueco.
+    ramp_top = z_far
+    ramp_bot = ramp_top - s * RAMP_SLOPE_RUN   # Extremo BAJO (hacia el centro).
+    return dict(hole=(-_HOLE_HX, _HOLE_HX, hz0, hz1),
+                ramp_top=ramp_top, ramp_bot=ramp_bot, s=s)
 
 
 def build_sky():
-    """Cielo como CÚPULA esférica: una esfera gigante forrada con el cielo
-    tormentoso (assets/ui/fondo.png) que envuelve TODO el nivel.
-
-    Frente a la caja anterior, la esfera no tiene esquinas ni costuras de
-    paredes: el cielo se curva de forma continua alrededor del jugador,
-    como un domo de planetario. Sigue ESTÁTICA en el mundo (no anclada a la
-    cámara), así que al caminar hay paralaje y se siente física.
-
-    Presupuesto: 1 sola Entity = 1 draw call y CERO updates por frame
-    (Panda3D no recorre un nodo estático que no cambia). Una malla esférica
-    de baja resolución es despreciable para cualquier GPU.
-
-    Notas de render:
-      - double_sided=True: la esfera se ve desde DENTRO (sus caras miran
-        hacia afuera; sin esto, el backface culling la volvería invisible).
-      - setFogOff(1): a 50+ u la niebla lineal (45..85) la teñiría; excluida
-        a nivel de nodo, el cielo se ve nítido y el mundo 3D se desvanece
-        HACIA su horizonte.
-      - Radio = SKY_DIST < FAR_CLIP: la cúpula entra entera en el frustum.
-      - unlit_shader: sin luces, el color de la acuarela llega crudo.
-    """
+    """Cielo tormentoso en acuarela como cúpula esférica (1 draw call)."""
     tex = load_texture('assets/ui/fondo.png')
-    # Centrada en el origen y a la ALTURA DEL OJO del jugador (~2 u): así el
-    # horizonte de la esfera (su ecuador) coincide con la línea del suelo y
-    # las nubes de tormenta quedan arriba, como un cielo real.
-    sky = Entity(model='sphere', texture=tex,
-                 position=Vec3(0, 2, 0), scale=SKY_DIST * 2,
-                 double_sided=True, shader=unlit_shader)
+    sky = Entity(model='sphere', texture=tex, position=Vec3(0, 2, 0),
+                 scale=SKY_DIST * 2, double_sided=True, shader=unlit_shader)
     sky.setFogOff(1)
-
-    # ---- Tapa del cenit ----
-    # Toda esfera UV "pellizca" su textura en los polos (converge a un punto).
-    # El polo superior queda justo sobre el jugador, así que al mirar arriba
-    # se vería ese vórtice. Un quad horizontal de nube plana lo oculta: se
-    # interpone entre el jugador y el polo. Color = gris claro de la nube
-    # alta (medido con PIL en la banda del polo), para fundirse con el cielo
-    # que lo rodea. (El polo inferior queda bajo el suelo, invisible.)
     cap = Entity(model='quad', color=color.hsv(0, 0.005, 0.86),
                  position=Vec3(0, 2 + SKY_DIST * 0.9, 0), rotation_x=90,
                  scale=SKY_DIST * 1.1, double_sided=True, shader=unlit_shader)
@@ -97,107 +87,148 @@ def build_sky():
     return [sky, cap]
 
 
-def build_world():
-    """Construye piso, muros perimetrales y sectores de escenografía.
+def _floor_tile(cx, cz, sx, sz, y):
+    """Trozo de piso texturizado (plano + collider), visible por ambos lados
+    (hace de techo del piso de abajo)."""
+    f = Entity(model='plane', position=Vec3(cx, y, cz), scale=Vec3(sx, 1, sz),
+               texture='assets/ui/piso.png',
+               texture_scale=(max(1, sx / 6), max(1, sz / 6)),
+               shader=unlit_shader, collider='box', double_sided=True)
+    f.texture.filtering = 'mipmap'
+    return f
 
-    Devuelve la lista de sectores para que SectorCuller los administre.
-    """
-    random.seed(WORLD_SEED)  # Mapa determinista: mismo layout en cada corrida.
 
-    # ---- Piso: UN solo plano con textura repetida (texture_scale) ----
-    # Placa metálica dibujada a tinta (assets/ui/piso.png). 1 entity +
-    # 1 textura tileada = 1 draw call para todo el suelo. Cada baldosa mide
-    # ~6 unidades; MAP_SIZE/6 repeticiones cubren el mapa sin estirar el
-    # dibujo. unlit_shader: sin luces, el gris del arte llega crudo (misma
-    # estética plana que el resto).
-    floor = Entity(model='plane', scale=(MAP_SIZE, 1, MAP_SIZE),
-                   texture='assets/ui/piso.png',
-                   texture_scale=(MAP_SIZE / 6, MAP_SIZE / 6),
+def _build_floor_plane(y, hole):
+    """Piso texturizado. Con hole=(hx0,hx1,hz0,hz1) se arma en 4 tiras dejando
+    ese hueco para la rampa; sin hole, un plano entero."""
+    if hole is None:
+        _floor_tile(0, 0, FLOOR_SIZE, FLOOR_SIZE, y)
+        return
+    hx0, hx1, hz0, hz1 = hole
+    _floor_tile(0, (-_H + hz0) / 2, FLOOR_SIZE, hz0 + _H, y)      # Sur.
+    _floor_tile(0, (hz1 + _H) / 2, FLOOR_SIZE, _H - hz1, y)       # Norte.
+    _floor_tile((-_H + hx0) / 2, (hz0 + hz1) / 2, hx0 + _H, hz1 - hz0, y)  # O.
+    _floor_tile((hx1 + _H) / 2, (hz0 + hz1) / 2, _H - hx1, hz1 - hz0, y)   # E.
+
+
+def _build_walls(y):
+    """4 muros perimetrales macizos, texturizados (tablones tileados)."""
+    wy = y + FLOOR_WALL_H / 2
+    t = 0.5
+    tiles = max(1, round(FLOOR_SIZE / (FLOOR_WALL_H * WALL_ASPECT)))
+    specs = [
+        (Vec3(0, wy, _H), Vec3(FLOOR_SIZE, FLOOR_WALL_H, t)),
+        (Vec3(0, wy, -_H), Vec3(FLOOR_SIZE, FLOOR_WALL_H, t)),
+        (Vec3(_H, wy, 0), Vec3(t, FLOOR_WALL_H, FLOOR_SIZE)),
+        (Vec3(-_H, wy, 0), Vec3(t, FLOOR_WALL_H, FLOOR_SIZE)),
+    ]
+    for pos, scale in specs:
+        w = Entity(model='cube', position=pos, scale=scale, color=color.white,
+                   texture='assets/ui/paredes.png', texture_scale=(tiles, 1),
                    shader=unlit_shader, collider='box')
-    # Mipmaps: sin ellos, las líneas de tinta del piso lejano hierven
-    # (aliasing) y en gama baja se nota muchísimo. La GPU elige el nivel
-    # por distancia; costo cero por frame.
-    floor.texture.filtering = 'mipmap'
-
-    # ---- Muros perimetrales: 4 cubos estirados, siempre visibles ----
-    # Cerca de tablones dibujados a tinta (assets/ui/paredes.png). El muro
-    # mide MAP_SIZE x 4 y el arte es 1408x768: si se estirara a lo largo,
-    # los tablones quedarían de metros de ancho. texture_scale lo TILEA
-    # horizontalmente las veces justas para conservar la proporción del
-    # dibujo (tilear UVs es gratis: misma textura, mismo draw call).
-    half = MAP_SIZE / 2
-    wall_h = 4
-    tiles = round(MAP_SIZE / (wall_h * 1408 / 768))   # ≈10 repeticiones.
-    for pos, scale in (
-        ((0, 2, half), (MAP_SIZE, wall_h, 1)),
-        ((0, 2, -half), (MAP_SIZE, wall_h, 1)),
-        ((half, 2, 0), (1, wall_h, MAP_SIZE)),
-        ((-half, 2, 0), (1, wall_h, MAP_SIZE)),
-    ):
-        wall = Entity(model='cube', position=pos, scale=scale,
-                      color=color.white, texture='assets/ui/paredes.png',
-                      texture_scale=(tiles, 1), collider='box')
-    # Mipmaps para la cerca: las líneas finas de tinta parpadean (aliasing)
-    # al verse de lejos; el mipmapping lo resuelve EN LA GPU eligiendo una
-    # versión reducida de la textura según la distancia. Costo: +33% de
-    # memoria de ESA textura, cero costo por frame. (La textura es
-    # compartida: basta configurarla una vez.)
-    wall.texture.filtering = 'mipmap'
-
-    # ---- Sectores de escenografía (cajas, columnas) ----
-    colliders_root = Entity()   # Padre de todos los colliders invisibles.
-    sectors = []
-    steps = range(int(-half), int(half), SECTOR_SIZE)
-    for sx in steps:
-        for sz in steps:
-            center = Vec3(sx + SECTOR_SIZE / 2, 0, sz + SECTOR_SIZE / 2)
-            sector = Entity(position=center)
-
-            for _ in range(random.randint(2, 4)):
-                if random.random() < 0.6:   # Caja / crate.
-                    s = random.uniform(1.0, 2.2)
-                    size = Vec3(s, s, s)
-                else:                        # Columna.
-                    size = Vec3(1, random.uniform(3, 5), 1)
-                lx = random.uniform(-SECTOR_SIZE / 2 + 2, SECTOR_SIZE / 2 - 2)
-                lz = random.uniform(-SECTOR_SIZE / 2 + 2, SECTOR_SIZE / 2 - 2)
-                _add_box(sector, colliders_root, Vec3(lx, size.y / 2, lz),
-                         size, random.choice(FLAT_PALETTE))
-
-            # LA optimización clave: N cubos hijos -> 1 sola malla/draw call.
-            # auto_destroy=True elimina los Entities hijos: dejan de existir
-            # en Python (menos objetos que recorrer por frame).
-            sector.combine(auto_destroy=True)
-            sector.texture = 'white_cube'
-            sectors.append(sector)
-
-    return sectors
+        w.texture.filtering = 'mipmap'
 
 
-class SectorCuller(Entity):
-    """Desactiva sectores lejanos. Corre a baja frecuencia (CULL_INTERVAL).
+def _in_corridor(lx, lz):
+    """True si (lx,lz) cae en la columna de alguna escalera (a evitar)."""
+    return abs(lx) < RAMP_WIDTH and 2.0 < abs(lz) < 24.0
 
-    Recorrer ~36 sectores 4 veces por segundo es despreciable para la CPU;
-    hacerlo cada frame sería pagar 60 veces por segundo por la misma info.
-    """
 
-    def __init__(self, sectors):
-        super().__init__()
-        self.sectors = sectors
-        self._timer = 0.0
-        # Distancia al CUADRADO: evita la raíz cuadrada en el bucle caliente.
-        self._max_dist_sq = RENDER_DISTANCE * RENDER_DISTANCE
+def _build_cover(y, rng, floor_index):
+    """Cajas y columnas de cobertura, evitando el centro (spawn en piso 0) y
+    las columnas de las escaleras."""
+    margin = _H - 4
+    placed = 0
+    tries = 0
+    while placed < COVER_PER_FLOOR and tries < COVER_PER_FLOOR * 10:
+        tries += 1
+        lx = rng.uniform(-margin, margin)
+        lz = rng.uniform(-margin, margin)
+        if floor_index == 0 and lx * lx + lz * lz < 36:
+            continue                         # No tapar el spawn.
+        if _in_corridor(lx, lz):
+            continue                         # No tapar las escaleras.
+        if rng.random() < 0.6:               # Caja.
+            s = rng.uniform(1.3, 2.4)
+            size = Vec3(s, s, s)
+        else:                                 # Columna.
+            size = Vec3(1, rng.uniform(2.5, 4.0), 1)
+        Entity(model='cube', position=Vec3(lx, y + size.y / 2, lz),
+               scale=size, color=rng.choice(FLAT_PALETTE),
+               shader=unlit_shader, collider='box')
+        placed += 1
 
-    def update(self):
-        self._timer += time.dt
-        if self._timer < CULL_INTERVAL:
-            return
-        self._timer = 0.0
 
-        cam = camera.world_position
-        for sector in self.sectors:
-            offset = sector.position - cam
-            dist_sq = offset.x * offset.x + offset.z * offset.z
-            enabled = dist_sq < self._max_dist_sq
-            if sector.enabled != enabled:    # Solo tocar el scene graph si cambió.
-                sector.enabled = enabled
+def _build_ramp(y, rc):
+    """Rampa suave dentro del hueco de escalera, del piso y al de arriba."""
+    rise = FLOOR_HEIGHT
+    run = RAMP_SLOPE_RUN
+    length = math.sqrt(run * run + rise * rise)
+    angle = math.degrees(math.atan2(rise, run))
+    mid_z = (rc['ramp_bot'] + rc['ramp_top']) / 2
+    # Ancho un poco mayor que el hueco para que se meta bajo las paredes
+    # laterales y NO queden rendijas por las que caer. El extremo ALTO va
+    # junto al muro; el signo de la rotación depende del lado.
+    Entity(model='cube', color=color.hsv(30, 0.10, 0.55), shader=unlit_shader,
+           position=Vec3(0, y + rise / 2, mid_z),
+           scale=Vec3(RAMP_WIDTH + 1.2, 0.3, length),
+           rotation=Vec3(-rc['s'] * angle, 0, 0), collider='box')
+
+
+def _build_shaft(y, rc):
+    """Hueco de escalera: 2 paredes laterales (permanentes) + PARED de entrada
+    (removible, de piso a techo). Devuelve la pared removible."""
+    s = rc['s']
+    entrance_z = rc['ramp_bot'] - s * 0.5            # Justo antes del pie.
+    far_z = rc['hole'][3] if s > 0 else rc['hole'][2]  # Borde junto al muro.
+    z0, z1 = sorted((entrance_z, far_z))
+    length = z1 - z0
+    mid_z = (z0 + z1) / 2
+    wy = y + FLOOR_HEIGHT / 2
+    tiles = max(1, round(length / (FLOOR_HEIGHT * WALL_ASPECT)))
+    # Paredes laterales del hueco (permanentes): encierran la rampa.
+    for x in (-_SHAFT_HX, _SHAFT_HX):
+        w = Entity(model='cube', position=Vec3(x, wy, mid_z),
+                   scale=Vec3(0.4, FLOOR_HEIGHT, length), color=color.white,
+                   texture='assets/ui/paredes.png', texture_scale=(tiles, 1),
+                   shader=unlit_shader, collider='box')
+        w.texture.filtering = 'mipmap'
+    # PARED DE FONDO (fondo del hueco, permanente): sin ella se podía rodear
+    # y colarse por DEBAJO de la rampa. Bastante más baja que el techo para NO
+    # estorbar al emerger arriba (el jugador sale a la altura del piso, por
+    # encima de esta pared), pero suficiente para tapar el paso a ras de suelo.
+    bh = FLOOR_HEIGHT - 1.5
+    back = Entity(model='cube', position=Vec3(0, y + bh / 2, far_z),
+                  scale=Vec3(RAMP_WIDTH + 1.0, bh, 0.4),
+                  color=color.white, texture='assets/ui/paredes.png',
+                  texture_scale=(1, 1), shader=unlit_shader, collider='box')
+    back.texture.filtering = 'mipmap'
+    # PARED de entrada: de piso a techo, tapa el acceso. Removible.
+    gate = Entity(model='cube', color=GATE_COL, shader=unlit_shader,
+                  position=Vec3(0, wy, entrance_z),
+                  scale=Vec3(RAMP_WIDTH + 1.0, FLOOR_HEIGHT, 0.4),
+                  collider='box')
+    return gate
+
+
+def build_archive():
+    """Construye los 3 pisos. Devuelve (floors, gates):
+      floors: lista de dicts {index, y}.
+      gates:  {piso: [pared_removible]} para los pisos con rampa (0 y 1)."""
+    rng = random.Random(WORLD_SEED)
+    floors = []
+    gates = {}
+    for i in range(N_FLOORS):
+        y = FLOOR_Y[i]
+        # Hueco en el piso: por donde sube el piso de ABAJO (RAMP_SIDES[i-1]).
+        hole = _corridor(RAMP_SIDES[i - 1])['hole'] if i > 0 else None
+        _build_floor_plane(y, hole)
+        _build_walls(y)
+        _build_cover(y, rng, i)
+        # Rampa hacia arriba (todos menos el último), en su lado.
+        if i < N_FLOORS - 1:
+            rc = _corridor(RAMP_SIDES[i])
+            _build_ramp(y, rc)
+            gates[i] = [_build_shaft(y, rc)]
+        floors.append(dict(index=i, y=y))
+    return floors, gates

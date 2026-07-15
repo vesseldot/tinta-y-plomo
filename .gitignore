@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Config local de Claude Code / editor (no compartir)
+.claude/
+error.log

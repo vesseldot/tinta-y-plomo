@@ -21,8 +21,8 @@ import random
 from ursina import Entity, Vec3, color, invoke, time
 
 from config import (CRATE_COUNT, CRATE_HEAL, CRATE_PICKUP_RADIUS,
-                    CRATE_RESPAWN_DELAY, LOOT_CHECK_INTERVAL, MAP_SIZE,
-                    WEAPONS)
+                    CRATE_RESPAWN_DELAY, FLOOR_SIZE, FLOOR_Y, N_FLOORS,
+                    LOOT_CHECK_INTERVAL, WEAPONS)
 
 
 class Crate(Entity):
@@ -36,7 +36,7 @@ class Crate(Entity):
     COLORS = {
         'weapon': color.hsv(0, 0.55, 0.85),    # Rojo plano: armas.
         'ammo': color.hsv(45, 0.6, 0.85),      # Amarillo plano: balas.
-        'health': color.hsv(0, 0.0, 0.9),      # Blanco/gris: botiquín.
+        'health': color.hsv(130, 0.6, 0.75),   # Verde: botiquín (recupera vida).
     }
     KINDS = ('weapon', 'ammo', 'health')
 
@@ -45,6 +45,7 @@ class Crate(Entity):
                          color=Crate.COLORS[kind], collider='box')
         self.kind = kind
         self.manager = manager
+        self.floor = 0                   # Piso donde vive (lo fija LootManager).
 
     def take_damage(self, amount):
         # Dispararle a la caja también la abre: mismo duck typing que usa
@@ -62,16 +63,34 @@ class LootManager(Entity):
         self._timer = 0.0
         self._pickup_sq = CRATE_PICKUP_RADIUS ** 2   # Distancia², sin sqrt.
 
+        # Un juego COMPLETO (arma + munición + VIDA) GARANTIZADO en cada piso,
+        # y los extras restantes repartidos cíclicamente.
+        combos = [(kind, floor) for floor in range(N_FLOORS)
+                  for kind in Crate.KINDS]
+        i = 0
+        while len(combos) < CRATE_COUNT:
+            combos.append((Crate.KINDS[i % len(Crate.KINDS)], i % N_FLOORS))
+            i += 1
+
         self.crates = []
-        for i in range(CRATE_COUNT):     # Reparto cíclico: arma/balas/vida.
-            crate = Crate(Crate.KINDS[i % len(Crate.KINDS)], self)
+        for kind, floor in combos[:CRATE_COUNT]:
+            crate = Crate(kind, self)
+            crate.floor = floor
             self._place(crate)
             self.crates.append(crate)
 
     def _place(self, crate):
-        margin = MAP_SIZE / 2 - 5
-        crate.position = Vec3(random.uniform(-margin, margin), 0.4,
-                              random.uniform(-margin, margin))
+        # La caja vive en SU piso, dentro de los muros y fuera del corredor de
+        # la rampa/hueco (x≈0, z 0..22), para no bloquearlo ni caer por él.
+        margin = FLOOR_SIZE / 2 - 5
+        y = FLOOR_Y[crate.floor]
+        for _ in range(12):
+            x = random.uniform(-margin, margin)
+            z = random.uniform(-margin, margin)
+            if abs(x) < 6 and -2 < z < 22:      # Corredor de la rampa/hueco.
+                continue
+            break
+        crate.position = Vec3(x, y + 0.4, z)
         crate.enabled = True
 
     def update(self):
@@ -86,6 +105,10 @@ class LootManager(Entity):
         for crate in self.crates:
             if not crate.enabled:
                 continue
+            # Chequeo de ALTURA: sin esto recogerías una caja del piso de
+            # arriba a través del techo (el radio de recogida es en el plano).
+            if abs(crate.y - p.y) > 2.5:
+                continue
             dx = crate.x - p.x
             dz = crate.z - p.z
             if dx * dx + dz * dz < self._pickup_sq:
@@ -94,6 +117,12 @@ class LootManager(Entity):
     def consume(self, crate):
         if not crate.enabled:
             return
+        # Las cajas de VIDA (verdes) NO desaparecen: son estaciones de
+        # curación permanentes. Curan si te hace falta y se quedan en su
+        # sitio para volver a usarlas.
+        if crate.kind == 'health':
+            self.player.heal(CRATE_HEAL)
+            return
         # Los métodos devuelven False si no hacían falta: la caja se queda
         # en el mundo en vez de desperdiciarse (mismo if, costo cero).
         if crate.kind == 'weapon':
@@ -101,10 +130,8 @@ class LootManager(Entity):
             # munición de esa arma (lógica en combat.give_weapon).
             accepted = self.weapon.give_weapon(
                 random.choice(list(WEAPONS.keys())))
-        elif crate.kind == 'ammo':
+        else:  # 'ammo'
             accepted = self.weapon.add_ammo()
-        else:
-            accepted = self.player.heal(CRATE_HEAL)
         if not accepted:
             return
         crate.enabled = False
