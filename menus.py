@@ -47,7 +47,7 @@ class MenuManager(Entity):
         player.on_death = self.show_game_over
 
         # Arrancamos EN la pantalla de inicio, con el mundo congelado.
-        self._show_screen('EL ÚLTIMO ROLLO',
+        self._show_screen('TINTA Y PLOMO',
                           'ENTER / ESPACIO: comenzar el caso        ESC: salir')
 
     # ---------------------------------------------------------- pantallas
@@ -88,6 +88,13 @@ class MenuManager(Entity):
         self._show_screen('FIN',
                           'ENTER / ESPACIO: otra toma        ESC: salir')
 
+    def show_win(self):
+        """Victoria: se llama al derrotar al Jefe Final (piso 3)."""
+        self.state = 'win'
+        self._show_screen('CASO CERRADO',
+                          'Derrotaste al jefe del archivero.        '
+                          'ENTER / ESPACIO: otra partida    ESC: salir')
+
     def restart(self):
         # Reiniciar = reusar: cada sistema recoloca sus pools existentes.
         self.player.reset()
@@ -116,7 +123,7 @@ class MenuManager(Entity):
                 self.start_game()
             elif key == 'escape':
                 application.quit()
-        elif self.state == 'gameover':
+        elif self.state in ('gameover', 'win'):
             if confirm:
                 self.restart()
             elif key == 'escape':
